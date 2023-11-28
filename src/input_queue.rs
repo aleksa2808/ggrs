@@ -1,5 +1,6 @@
 use crate::frame_info::PlayerInput;
 use crate::{Config, Frame, InputStatus, NULL_FRAME};
+use bytemuck::Zeroable;
 use std::cmp;
 
 /// The length of the input queue. This describes the number of inputs GGRS can hold at the same time per player.
@@ -134,6 +135,9 @@ impl<T: Config> InputQueue<T> {
                     _ => self.head - 1,
                 };
                 self.prediction = self.inputs[previous_position];
+
+                // override prediction with inactive input
+                self.prediction.input = T::Input::zeroed();
             }
             // update the prediction's frame
             self.prediction.frame += 1;
