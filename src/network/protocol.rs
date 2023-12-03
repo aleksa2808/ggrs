@@ -469,7 +469,7 @@ impl<T: Config> UdpProtocol<T> {
         self.send_pending_output(connect_status);
     }
 
-    fn send_pending_output(&mut self, connect_status: &[ConnectionStatus]) {
+    pub fn send_pending_output(&mut self, connect_status: &[ConnectionStatus]) {
         let mut body = Input::default();
 
         if let Some(input) = self.pending_output.front() {
@@ -654,42 +654,46 @@ impl<T: Config> UdpProtocol<T> {
         };
 
         // if we have the necessary input saved, we decode
-        if let Some(decode_inp) = self.recv_inputs.get(&decode_frame) {
-            self.running_last_input_recv = Instant::now();
+        let decode_inp = self
+            .recv_inputs
+            .get(&decode_frame)
+            // TODO when will this error out?
+            .expect("cannot find the frame needed to decode the input with");
 
-            let recv_inputs = decode(&decode_inp.bytes, &body.bytes).expect("decoding failed");
+        self.running_last_input_recv = Instant::now();
 
-            for (i, inp) in recv_inputs.into_iter().enumerate() {
-                let inp_frame = body.start_frame + i as i32;
-                // skip inputs that we don't need
-                if inp_frame <= self.last_recv_frame() {
-                    continue;
-                }
+        let recv_inputs = decode(&decode_inp.bytes, &body.bytes).expect("decoding failed");
 
-                let input_data = InputBytes {
-                    frame: inp_frame,
-                    bytes: inp,
-                };
-                // send the input to the session
-                let player_inputs = input_data.to_player_inputs::<T>(self.handles.len());
-                self.recv_inputs.insert(input_data.frame, input_data);
-
-                for (i, player_input) in player_inputs.into_iter().enumerate() {
-                    self.event_queue.push_back(Event::Input {
-                        input: player_input,
-                        player: self.handles[i],
-                    });
-                }
+        for (i, inp) in recv_inputs.into_iter().enumerate() {
+            let inp_frame = body.start_frame + i as i32;
+            // skip inputs that we don't need
+            if inp_frame <= self.last_recv_frame() {
+                continue;
             }
 
-            // send an input ack
-            self.send_input_ack();
+            let input_data = InputBytes {
+                frame: inp_frame,
+                bytes: inp,
+            };
+            // send the input to the session
+            let player_inputs = input_data.to_player_inputs::<T>(self.handles.len());
+            self.recv_inputs.insert(input_data.frame, input_data);
 
-            // delete received inputs that are too old
-            let last_recv_frame = self.last_recv_frame();
-            self.recv_inputs
-                .retain(|&k, _| k >= last_recv_frame - 2 * self.max_prediction as i32);
+            for (i, player_input) in player_inputs.into_iter().enumerate() {
+                self.event_queue.push_back(Event::Input {
+                    input: player_input,
+                    player: self.handles[i],
+                });
+            }
         }
+
+        // send an input ack
+        self.send_input_ack();
+
+        // delete received inputs that are too old
+        let last_recv_frame = self.last_recv_frame();
+        self.recv_inputs
+            .retain(|&k, _| k >= last_recv_frame - 2 * self.max_prediction as i32);
     }
 
     /// Upon receiving a `InputAck`, discard the oldest buffered input including the acked input.

@@ -246,20 +246,14 @@ impl<T: Config> P2PSession<T> {
     /// Returns an order-sensitive [`Vec<GgrsRequest>`]. You should fulfill all requests in the exact order they are provided.
     /// Failure to do so will cause panics later.
     ///
-    /// # Errors
-    /// - Returns [`InvalidRequest`] if the provided player handle refers to a remote player.
-    /// - Returns [`NotSynchronized`] if the session is not yet ready to accept input. In this case, you either need to start the session or wait for synchronization between clients.
-    ///
     /// [`Vec<GgrsRequest>`]: GgrsRequest
-    /// [`InvalidRequest`]: GgrsError::InvalidRequest
-    /// [`NotSynchronized`]: GgrsError::NotSynchronized
-    pub fn advance_frame(&mut self) -> Result<Vec<GgrsRequest<T>>, GgrsError> {
+    pub fn advance_frame(&mut self) -> Vec<GgrsRequest<T>> {
         // receive info from remote players, trigger events and send messages
         self.poll_remote_clients();
 
         // session is not running and synchronized
         if self.state != SessionState::Running {
-            return Err(GgrsError::NotSynchronized);
+            panic!("session is not running and synchronized")
         }
 
         // This list of requests will be returned to the user
@@ -285,37 +279,48 @@ impl<T: Config> P2PSession<T> {
         let first_incorrect = self
             .sync_layer
             .check_simulation_consistency(self.disconnect_frame);
+
+        // advance the frame only if we haven't reached the prediction threshold
+        let should_advance_frame = self.sync_layer.current_frame() < self.max_prediction as i32
+            || (self.sync_layer.current_frame() - confirmed_frame) < self.max_prediction as i32;
+
         if first_incorrect != NULL_FRAME {
             self.adjust_gamestate(first_incorrect, confirmed_frame, &mut requests);
             self.disconnect_frame = NULL_FRAME;
         }
 
-        let last_saved = self.sync_layer.last_saved_frame();
-        if self.sparse_saving {
-            self.check_last_saved_state(last_saved, confirmed_frame, &mut requests);
-        } else {
-            // without sparse saving, always save the current frame after correcting and rollbacking
-            requests.push(self.sync_layer.save_current_state());
-        }
+        if should_advance_frame {
+            // save the frame state only if we are going to advance it
+            if self.sparse_saving {
+                let last_saved = self.sync_layer.last_saved_frame();
+                self.check_last_saved_state(last_saved, confirmed_frame, &mut requests);
+            } else {
+                // without sparse saving, always save the current frame after correcting and rollbacking
+                requests.push(self.sync_layer.save_current_state());
+            }
 
-        /*
-         *  SEND OFF AND THROW AWAY INPUTS BEFORE THE CONFIRMED FRAME
-         */
+            /*
+             *  SEND OFF AND THROW AWAY INPUTS BEFORE THE CONFIRMED FRAME
+             */
 
-        // send confirmed inputs to spectators before throwing them away
-        self.send_confirmed_inputs_to_spectators(confirmed_frame);
+            // send confirmed inputs to spectators before throwing them away
+            // don't care about spectators currently, need to check what this method does
+            self.send_confirmed_inputs_to_spectators(confirmed_frame);
 
-        // set the last confirmed frame and discard all saved inputs before that frame
-        self.sync_layer
-            .set_last_confirmed_frame(confirmed_frame, self.sparse_saving);
+            // set the last confirmed frame and discard all saved inputs before that frame
+            // we know that the confirmed_frame didn't advance if there is still n room for more predictions (unless it was changed in the meantime, this is TODO)
+            self.sync_layer
+                .set_last_confirmed_frame(confirmed_frame, self.sparse_saving);
 
-        /*
-         *  DESYNC DETECTION
-         */
-        // collect, send, compare and check the last checksums against the other peers
-        if self.desync_detection != DesyncDetection::Off {
-            self.check_checksum_send_interval();
-            self.compare_local_checksums_against_peers();
+            /*
+             *  DESYNC DETECTION
+             */
+            // collect, send, compare and check the last checksums against the other peers
+            // TODO don't remember why we can skip this
+            if self.desync_detection != DesyncDetection::Off {
+                self.check_checksum_send_interval();
+                self.compare_local_checksums_against_peers();
+            }
         }
 
         /*
@@ -323,27 +328,31 @@ impl<T: Config> P2PSession<T> {
          */
 
         // check time sync between clients and send wait recommendation, if appropriate
+        // TODO not really sure what this does
         self.check_wait_recommendation();
 
         /*
          *  INPUTS
          */
 
-        // register local inputs in the system and send them
-        for handle in self.player_reg.local_player_handles() {
-            match self.local_inputs.get_mut(&handle) {
-                Some(player_input) => {
-                    // send the input into the sync layer
-                    let actual_frame = self.sync_layer.add_local_input(handle, *player_input)?;
-                    assert!(actual_frame != NULL_FRAME);
-                    // if not dropped, send the input to all other clients, but with the correct frame (influenced by input delay)
-                    player_input.frame = actual_frame;
-                    self.local_connect_status[handle].last_frame = actual_frame;
-                }
-                None => {
-                    return Err(GgrsError::InvalidRequest {
-                        info: "Missing local input while calling advance_frame().".to_owned(),
-                    });
+        if should_advance_frame {
+            // register local inputs in the system and send them
+            // if the frame should be skipped we will drop the inputs
+            for handle in self.player_reg.local_player_handles() {
+                match self.local_inputs.get_mut(&handle) {
+                    Some(player_input) => {
+                        let actual_frame = self
+                            .sync_layer
+                            .add_local_input(handle, *player_input)
+                            .unwrap();
+                        assert!(actual_frame != NULL_FRAME);
+                        // if not dropped, send the input to all other clients, but with the correct frame (influenced by input delay)
+                        player_input.frame = actual_frame;
+                        self.local_connect_status[handle].last_frame = actual_frame;
+                    }
+                    None => {
+                        panic!("missing local input while calling advance_frame()");
+                    }
                 }
             }
         }
@@ -351,26 +360,35 @@ impl<T: Config> P2PSession<T> {
         // send the inputs to all clients
         for endpoint in self.player_reg.remotes.values_mut() {
             // send the input directly
-            endpoint.send_input(&self.local_inputs, &self.local_connect_status);
+            if should_advance_frame {
+                // send current input and previous inputs that weren't acked
+                endpoint.send_input(&self.local_inputs, &self.local_connect_status);
+            } else {
+                // send only previous inputs that weren't acked
+                endpoint.send_pending_output(&self.local_connect_status);
+            }
             endpoint.send_all_messages(&mut self.socket);
         }
 
         // clear the local inputs after sending them
-        self.local_inputs.clear();
+        if should_advance_frame {
+            // if we skipped the frame we also didn't add any local input
+            self.local_inputs.clear();
 
-        /*
-         * ADVANCE THE STATE
-         */
+            /*
+             * ADVANCE THE STATE
+             */
 
-        // get correct inputs for the current frame
-        let inputs = self
-            .sync_layer
-            .synchronized_inputs(&self.local_connect_status);
-        // advance the frame count
-        self.sync_layer.advance_frame();
-        requests.push(GgrsRequest::AdvanceFrame { inputs });
+            // get correct inputs for the current frame
+            let inputs = self
+                .sync_layer
+                .synchronized_inputs(&self.local_connect_status);
+            // advance the frame count
+            self.sync_layer.advance_frame();
+            requests.push(GgrsRequest::AdvanceFrame { inputs });
+        }
 
-        Ok(requests)
+        requests
     }
 
     /// Should be called periodically by your application to give GGRS a chance to do internal work.
